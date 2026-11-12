@@ -37,6 +37,7 @@
         {
           # Native contracts and linting do not depend on the Semgrep package.
           rust-tests = pkgs.callPackage ./packages/project-check-core.nix { };
+          semgrep-compatibility = import ./tests/semgrep-compatibility.nix { inherit pkgs; };
           # Round-trips the immutable portable rules against their positive and
           # negative fixtures through the real Semgrep scanner. Opt-in: it builds
           # Semgrep.
