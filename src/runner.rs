@@ -1,3 +1,4 @@
+use crate::environment::{self, Loaded};
 use crate::manifest::{Check, Manifest, WarningPolicy};
 use crate::process::{CaptureFailure, Signals, capture};
 use crate::{
@@ -8,6 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -17,7 +19,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub const TOOLCHAIN_HINT: &str = "Enter the project toolchain with `devenv shell` (or `nix develop .`), then retry. If the tool is still unavailable, declare it in devenv.nix or flake.nix devShells and check its executable permissions/interpreter.";
+pub const TOOLCHAIN_HINT: &str = "Declare the tool in the project's flake devShells output and set `\"environment\": {\"kind\": \"nix-devshell\"}` in .project-checks.json so project-check runs every check inside it, independent of the caller's PATH. Without that declaration, enter the toolchain with `nix develop .` (or `devenv shell`) and retry. Also check the tool's executable permissions/interpreter.";
+pub const ENVIRONMENT_HINT: &str = "The declared project environment is active: add the tool to the project's flake devShell rather than installing it elsewhere.";
+
+fn toolchain_hint(environment: &Loaded) -> &'static str {
+    if environment.report.is_some() {
+        ENVIRONMENT_HINT
+    } else {
+        TOOLCHAIN_HINT
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Tools {
@@ -25,6 +36,9 @@ pub struct Tools {
     pub scanner: PathBuf,
     pub docs: PathBuf,
     pub ca: Option<PathBuf>,
+    /// Evaluates a declared project environment; the caller's `nix` by default
+    /// so its configuration, daemon and substituters apply.
+    pub nix: PathBuf,
 }
 impl Default for Tools {
     fn default() -> Self {
@@ -35,6 +49,7 @@ impl Default for Tools {
                 .unwrap_or_default()
                 .with_file_name("project-docs"),
             ca: None,
+            nix: PathBuf::from("nix"),
         }
     }
 }
@@ -71,13 +86,16 @@ impl Tools {
                     scanner: field("scanner")?,
                     docs: field("docs")?,
                     ca: Some(field("ca")?),
+                    nix: PathBuf::from("nix"),
                 })
             }
         }
     }
 }
 
-pub fn program_available(program: &str, cwd: &Path) -> bool {
+/// Resolves `program` like the child process will: explicit paths from `cwd`,
+/// bare names through `path` (the check's effective `PATH`).
+pub fn program_available(program: &str, cwd: &Path, path: Option<&OsStr>) -> bool {
     fn executable(path: &Path) -> bool {
         fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
             && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
@@ -90,8 +108,8 @@ pub fn program_available(program: &str, cwd: &Path) -> bool {
             cwd.join(path)
         });
     }
-    env::var_os("PATH").is_some_and(|paths| {
-        env::split_paths(&paths).any(|path| {
+    path.is_some_and(|paths| {
+        env::split_paths(paths).any(|path| {
             let path = if path.is_absolute() {
                 path
             } else {
@@ -108,6 +126,7 @@ pub fn run_check(
     scratch: &Path,
     cache: &Path,
     tools: &Tools,
+    environment: &Loaded,
     signals: &Signals,
 ) -> Result<Value> {
     signals.check()?;
@@ -121,20 +140,29 @@ pub fn run_check(
             return Ok(result);
         }
     };
+    if let Some(blocker) = &environment.blocker {
+        result["diagnostics"] = json!(format!("project environment unavailable: {blocker}"));
+        return Ok(result);
+    }
+    let search_path = environment.search_path();
     let missing: Vec<_> = check
         .requires
         .iter()
-        .filter(|name| !program_available(name, &cwd))
+        .filter(|name| !program_available(name, &cwd, search_path.as_deref()))
         .cloned()
         .collect();
     if !missing.is_empty() {
         result["diagnostics"] = json!(format!(
-            "missing required programs: {}\n{TOOLCHAIN_HINT}",
-            missing.join(", ")
+            "missing required programs: {}\n{}",
+            missing.join(", "),
+            toolchain_hint(environment)
         ));
         return Ok(result);
     }
     let mut command = Command::new(&check.argv[0]);
+    environment.apply(&mut command);
+    let mut rustflags = environment.variable("RUSTFLAGS").unwrap_or_default();
+    rustflags.push(" -D warnings");
     command
         .args(&check.argv[1..])
         .current_dir(&cwd)
@@ -142,10 +170,7 @@ pub fn run_check(
         .env("CARGO_TARGET_DIR", cache.join("cargo-target"))
         .env("RUFF_CACHE_DIR", cache.join("ruff"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env(
-            "RUSTFLAGS",
-            format!("{} -D warnings", env::var("RUSTFLAGS").unwrap_or_default()),
-        );
+        .env("RUSTFLAGS", rustflags);
     if let Some(ca) = &tools.ca {
         command
             .env("NIX_SSL_CERT_FILE", ca)
@@ -176,8 +201,9 @@ pub fn run_check(
         Ok(captured) => captured,
         Err(error) => {
             result["diagnostics"] = json!(format!(
-                "runner could not start {:?}: {error}\n{TOOLCHAIN_HINT}",
-                check.argv[0]
+                "runner could not start {:?}: {error}\n{}",
+                check.argv[0],
+                toolchain_hint(environment)
             ));
             return Ok(result);
         }
@@ -212,7 +238,7 @@ pub fn run_check(
     let output = String::from_utf8_lossy(&captured.output);
     let prefix = result["diagnostics"].as_str().unwrap_or("");
     result["diagnostics"] = json!(format!("{prefix}{output}"));
-    diagnostics::apply(check, &output, &mut result);
+    diagnostics::apply(check, &output, toolchain_hint(environment), &mut result);
     result["duration_seconds"] = json!((started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0);
     Ok(result)
 }
@@ -254,7 +280,16 @@ pub fn baseline(root: &Path, scratch: &Path, tools: &Tools, signals: &Signals) -
         expected_warnings: vec![],
         warnings: WarningPolicy::Fail,
     };
-    let mut result = run_check(root, &check, scratch, scratch, tools, signals)?;
+    // The packaged scanner is independent of any project environment.
+    let mut result = run_check(
+        root,
+        &check,
+        scratch,
+        scratch,
+        tools,
+        &Loaded::inherited(),
+        signals,
+    )?;
     result["rules_package"] = json!(tools.rules);
     result["language_coverage"] = json!(["python"]);
     let parsed = util::read_limited(&report_path, MAX_SCANNER_REPORT_BYTES)
@@ -314,6 +349,20 @@ pub fn baseline(root: &Path, scratch: &Path, tools: &Tools, signals: &Signals) -
     }
     signals.check()?;
     Ok(result)
+}
+
+fn print_environment(report: &Value) {
+    println!(
+        "==> environment {} {}: {} ({}s)",
+        report["kind"].as_str().unwrap_or(""),
+        report["installable"].as_str().unwrap_or(""),
+        report["status"].as_str().unwrap_or("blocked"),
+        report["duration_seconds"]
+    );
+    if let Some(text) = report["diagnostics"].as_str() {
+        println!("{text}");
+    }
+    let _ = io::stdout().flush();
 }
 
 fn append_diagnostic(result: &mut Value, extra: &str) {
@@ -450,6 +499,10 @@ pub fn run(
     if !json_output {
         println!("{}", results[0]["diagnostics"].as_str().unwrap_or(""));
     }
+    let environment = environment::load(root, manifest.environment.as_ref(), &tools.nix, signals)?;
+    if !json_output && let Some(report) = &environment.report {
+        print_environment(report);
+    }
     for check in checks {
         signals.check()?;
         reserved -= compact_capacity(&check.name)?;
@@ -458,7 +511,15 @@ pub fn run(
                 println!("==> {}", check.name);
                 io::stdout().flush()?;
             }
-            run_check(root, &check, scratch.path(), &cache, tools, signals)?
+            run_check(
+                root,
+                &check,
+                scratch.path(),
+                &cache,
+                tools,
+                &environment,
+                signals,
+            )?
         } else {
             json!({"name":check.name,"status":"not applicable","diagnostics":""})
         };
@@ -473,8 +534,11 @@ pub fn run(
         results.push(result);
     }
     signals.check()?;
-    let report =
+    let mut report =
         json!({"version":1,"profile":profile,"status":aggregate(&results),"checks":results});
+    if let Some(environment) = environment.report {
+        report["environment"] = environment;
+    }
     if json_output {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -509,13 +573,15 @@ pub fn plan(
         vec![]
     };
     let scanner = tools.scanner.to_string_lossy();
-    let missing: Vec<_> = (!program_available(&scanner, root))
+    let missing: Vec<_> = (!program_available(&scanner, root, env::var_os("PATH").as_deref()))
         .then(|| scanner.to_string())
         .into_iter()
         .collect();
     let mut checks = vec![
         json!({"name":"baseline","status":if missing.is_empty() && tools.rules.is_dir() {"ready"} else {"blocked"},"missing_programs":missing,"cwd_unavailable":false,"rules_unavailable":!tools.rules.is_dir()}),
     ];
+    let environment = environment::load(root, manifest.environment.as_ref(), &tools.nix, signals)?;
+    let search_path = environment.search_path();
     if changed {
         checks[0]["relevance"] = json!("required");
         checks[0]["matched_total"] = json!(0);
@@ -532,10 +598,20 @@ pub fn plan(
         let missing: Vec<_> = std::iter::once(&check.argv[0])
             .chain(&check.requires)
             .filter(|program| seen.insert(*program))
-            .filter(|program| !program_available(program, cwd.as_deref().unwrap_or(root)))
+            .filter(|program| {
+                !program_available(
+                    program,
+                    cwd.as_deref().unwrap_or(root),
+                    search_path.as_deref(),
+                )
+            })
             .cloned()
             .collect();
-        let mut planned = json!({"name":check.name,"status":if unavailable || !missing.is_empty() {"blocked"} else {"ready"},"missing_programs":missing,"cwd_unavailable":unavailable,"timeout_seconds":check.timeout_seconds});
+        let environment_unavailable = environment.blocker.is_some();
+        let mut planned = json!({"name":check.name,"status":if unavailable || environment_unavailable || !missing.is_empty() {"blocked"} else {"ready"},"missing_programs":missing,"cwd_unavailable":unavailable,"timeout_seconds":check.timeout_seconds});
+        if environment_unavailable {
+            planned["environment_unavailable"] = json!(true);
+        }
         if !check.expected_warnings.is_empty() {
             planned["expected_warnings"] = json!(check.expected_warnings);
         }
@@ -556,6 +632,9 @@ pub fn plan(
     };
     let mut report =
         json!({"version":1,"mode":"plan","profile":profile,"status":status,"checks":checks});
+    if let Some(environment) = environment.report {
+        report["environment"] = environment;
+    }
     if manifest.version > 0 {
         report["manifest_version"] = json!(manifest.version);
         report["schema_version"] = json!(crate::manifest::SCHEMA_VERSION);
@@ -580,7 +659,11 @@ mod safety_regressions {
             fs::set_permissions(&tool, fs::Permissions::from_mode(mode)).unwrap();
             let expected = nix::unistd::access(&tool, nix::unistd::AccessFlags::X_OK).is_ok();
             assert_eq!(
-                program_available(tool.to_str().unwrap(), root.path()),
+                program_available(
+                    tool.to_str().unwrap(),
+                    root.path(),
+                    env::var_os("PATH").as_deref()
+                ),
                 expected,
                 "mode {mode:o}"
             );

@@ -66,6 +66,17 @@ pub fn report_blocked(error: &Error, json_output: bool) {
 }
 
 fn print_plan(report: &Value) {
+    if let Some(environment) = report.get("environment") {
+        println!(
+            "environment {} {}: {}",
+            environment["kind"].as_str().unwrap_or(""),
+            environment["installable"].as_str().unwrap_or(""),
+            environment["status"].as_str().unwrap_or("blocked")
+        );
+        if let Some(text) = environment["diagnostics"].as_str() {
+            println!("{text}");
+        }
+    }
     for check in report["checks"].as_array().expect("plan checks") {
         let mut problems: Vec<String> = check["missing_programs"]
             .as_array()
@@ -79,6 +90,9 @@ fn print_plan(report: &Value) {
         }
         if check["rules_unavailable"] == true {
             problems.push("portable rules unavailable".into());
+        }
+        if check["environment_unavailable"] == true {
+            problems.push("project environment unavailable".into());
         }
         let detail = if problems.is_empty() {
             String::new()

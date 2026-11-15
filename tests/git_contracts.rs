@@ -126,6 +126,7 @@ impl Fixture {
             scanner: shell(),
             docs: shell(),
             ca: None,
+            nix: shell(),
         }
     }
 }
@@ -345,6 +346,7 @@ fn changed_plan_annotates_relevance_without_skipping_or_executing_checks() {
             fixture.check("unmapped", None),
         ],
         watch_ignore: vec![],
+        environment: None,
     };
     let report = runner::plan(
         &fixture.root,
@@ -414,6 +416,7 @@ fn changed_plan_limits_examples_but_counts_all_matches() {
         version: 2,
         checks: vec![fixture.check("code", Some(&["src/"]))],
         watch_ignore: vec![],
+        environment: None,
     };
     let report = runner::plan(
         &fixture.root,

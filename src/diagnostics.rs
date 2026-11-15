@@ -25,11 +25,26 @@ static ENVIRONMENT_FAILURE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("constant environment regex")
 });
 
+// The host refused a new thread or process (cgroup pids.max, ulimit -u): the
+// check never reached a verdict about the code.
+static RESOURCE_EXHAUSTED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"failed to create new OS thread|fork: (?:retry: )?Resource temporarily unavailable|",
+        r"Resource temporarily unavailable \(os error 11\)|can't start new thread|",
+        r"pthread_create failed: Resource temporarily unavailable"
+    ))
+    .expect("constant resource regex")
+});
+pub const RESOURCE_HINT: &str = "The host refused a new thread or process (task limit reached, errno EAGAIN). This is an environment blocker, not a code failure: retry when fewer processes run, or raise the task limit of the agent slice.";
+
 pub fn is_warning(text: &str) -> bool {
     WARNING.is_match(text)
 }
 pub fn is_environment_failure(text: &str) -> bool {
     ENVIRONMENT_FAILURE.is_match(text)
+}
+pub fn is_resource_exhausted(text: &str) -> bool {
+    RESOURCE_EXHAUSTED.is_match(text)
 }
 
 // Python splitlines recognizes more separators than Rust str::lines. Exact
@@ -41,7 +56,7 @@ pub fn lines(text: &str) -> impl Iterator<Item = &str> {
     ])
 }
 
-pub fn apply(check: &Check, output: &str, result: &mut Value) {
+pub fn apply(check: &Check, output: &str, toolchain_hint: &str, result: &mut Value) {
     let mut warnings = BTreeMap::<&str, usize>::new();
     for line in lines(output) {
         if is_warning(line) && !NIX_NOTICE.is_match(line) {
@@ -66,10 +81,13 @@ pub fn apply(check: &Check, output: &str, result: &mut Value) {
     } else if matches!(returncode, Some(126 | 127)) {
         result["status"] = json!("blocked");
         extra.push_str(&format!(
-            "\nCommand unavailable (exit {}).\n{}\n",
+            "\nCommand unavailable (exit {}).\n{toolchain_hint}\n",
             returncode.unwrap_or(127),
-            crate::runner::TOOLCHAIN_HINT
         ));
+    } else if result["status"] == "failed" && is_resource_exhausted(output) {
+        result["status"] = json!("blocked");
+        result["resource_exhausted"] = json!(true);
+        extra.push_str(&format!("\n{RESOURCE_HINT}\n"));
     } else if result["status"] == "failed" && is_environment_failure(output) {
         result["status"] = json!("blocked");
     } else if result["status"] == "passed" {

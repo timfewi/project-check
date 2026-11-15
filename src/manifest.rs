@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Component, Path};
 use std::sync::LazyLock;
 
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 pub const MANIFEST: &str = ".project-checks.json";
 const MAX_CHECKS: usize = 128;
 const MAX_ARGV: usize = 4096;
@@ -31,6 +31,7 @@ const DOCUMENT_FIELDS: &[(&str, u64)] = &[
     ("checks", 1),
     ("watch_ignore", 1),
     ("warnings", 2),
+    ("environment", 3),
 ];
 const CHECK_FIELDS: &[(&str, u64)] = &[
     ("name", 1),
@@ -49,7 +50,18 @@ pub struct Manifest {
     pub version: u64,
     pub checks: Vec<Check>,
     pub watch_ignore: Vec<String>,
+    pub environment: Option<EnvironmentSpec>,
 }
+
+/// A declared project toolchain that checks run inside instead of the caller's PATH.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentSpec {
+    /// Flake output name evaluated as `.#<shell>` from the project root.
+    pub shell: String,
+    pub timeout_seconds: f64,
+}
+
+pub const DEFAULT_ENVIRONMENT_TIMEOUT: f64 = 600.0;
 
 impl Manifest {
     pub fn empty() -> Self {
@@ -57,6 +69,7 @@ impl Manifest {
             version: 0,
             checks: Vec::new(),
             watch_ignore: Vec::new(),
+            environment: None,
         }
     }
 }
@@ -431,11 +444,62 @@ pub fn validate(root: &Path, document: &Value) -> Result<Manifest> {
             .collect::<Result<_>>()?,
     };
     validate_watch_ignore(&watch_ignore)?;
+    let environment = document.get("environment").map(environment).transpose()?;
     Ok(Manifest {
         version,
         checks,
         watch_ignore,
+        environment,
     })
+}
+
+fn environment(value: &Value) -> Result<EnvironmentSpec> {
+    let error = |detail: &str| Error::new(format!("environment: {detail}"));
+    let fields = value
+        .as_object()
+        .ok_or_else(|| error("must be an object"))?;
+    if let Some(field) = fields
+        .keys()
+        .find(|field| !["kind", "shell", "timeout_seconds"].contains(&field.as_str()))
+    {
+        return Err(error(&format!(
+            "unknown field '{field}'; supported fields are kind, shell and timeout_seconds"
+        )));
+    }
+    if fields.get("kind").and_then(Value::as_str) != Some("nix-devshell") {
+        return Err(error("kind must be 'nix-devshell'"));
+    }
+    let shell = match fields.get("shell") {
+        None => "default",
+        Some(value) => value
+            .as_str()
+            .filter(|shell| valid_shell(shell))
+            .ok_or_else(|| {
+                error("shell must be a flake output name of at most 128 letters, digits, '_', '-' or '.'")
+            })?,
+    };
+    let timeout_seconds = match fields.get("timeout_seconds") {
+        None => DEFAULT_ENVIRONMENT_TIMEOUT,
+        Some(value) => value
+            .as_f64()
+            .filter(|timeout| timeout.is_finite() && *timeout > 0.0 && *timeout <= 3600.0)
+            .ok_or_else(|| error("timeout_seconds must be between 0 and 3600 seconds"))?,
+    };
+    Ok(EnvironmentSpec {
+        shell: shell.into(),
+        timeout_seconds,
+    })
+}
+
+fn valid_shell(shell: &str) -> bool {
+    shell.len() <= 128
+        && shell
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && shell
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn preserve_layout(text: &str, document: &Value, upgraded: &Value) -> Option<String> {
@@ -498,13 +562,15 @@ pub fn migrate(root: &Path, write: bool) -> Result<Value> {
     let (text, document) = read_manifest(root)?;
     let original = version(&document)?;
     let mut upgraded = document.clone();
+    let fields = upgraded
+        .as_object_mut()
+        .expect("version requires an object");
     if original == 1 {
-        let fields = upgraded
-            .as_object_mut()
-            .expect("version requires an object");
+        // Version 2 changed the default warning policy; keep version 1 behavior explicit.
         fields.entry("warnings").or_insert_with(|| json!("fail"));
-        fields.insert("version".into(), json!(SCHEMA_VERSION));
     }
+    // Version 3 only added the optional environment field: no behavior to preserve.
+    fields.insert("version".into(), json!(SCHEMA_VERSION));
     let status = if validate(root, &document).is_ok() {
         "current"
     } else {
@@ -587,7 +653,7 @@ mod tests {
             declared["version"] = version;
             invalid(root.path(), &declared, "version must be at least 1");
         }
-        invalid(root.path(), &document(3), "Update the project-check runner");
+        invalid(root.path(), &document(4), "Update the project-check runner");
         invalid(root.path(), &json!([]), "integer version");
         let mut declared = document(1);
         declared["checks"][0]["input_paths"] = json!(["src/"]);
@@ -618,6 +684,91 @@ mod tests {
             &declared,
             "field 'warnings' requires manifest version 2",
         );
+    }
+
+    #[test]
+    fn environment_is_explicit_bounded_and_version_gated() {
+        let root = TempDir::new().unwrap();
+        assert_eq!(
+            validate(root.path(), &document(3)).unwrap().environment,
+            None
+        );
+        let mut declared = document(3);
+        declared["environment"] = json!({"kind": "nix-devshell"});
+        assert_eq!(
+            validate(root.path(), &declared).unwrap().environment,
+            Some(EnvironmentSpec {
+                shell: "default".into(),
+                timeout_seconds: DEFAULT_ENVIRONMENT_TIMEOUT
+            })
+        );
+        declared["environment"] =
+            json!({"kind": "nix-devshell", "shell": "ci.web_2", "timeout_seconds": 30});
+        assert_eq!(
+            validate(root.path(), &declared).unwrap().environment,
+            Some(EnvironmentSpec {
+                shell: "ci.web_2".into(),
+                timeout_seconds: 30.0
+            })
+        );
+        for (environment, diagnostic) in [
+            (json!("nix-devshell"), "must be an object"),
+            (json!({}), "kind must be 'nix-devshell'"),
+            (json!({"kind": "devenv"}), "kind must be 'nix-devshell'"),
+            (
+                json!({"kind": "nix-devshell", "shell": ""}),
+                "shell must be",
+            ),
+            (
+                json!({"kind": "nix-devshell", "shell": "-x"}),
+                "shell must be",
+            ),
+            (
+                json!({"kind": "nix-devshell", "shell": "a#b"}),
+                "shell must be",
+            ),
+            (
+                json!({"kind": "nix-devshell", "shell": "../x"}),
+                "shell must be",
+            ),
+            (
+                json!({"kind": "nix-devshell", "shell": "x".repeat(129)}),
+                "shell must be",
+            ),
+            (
+                json!({"kind": "nix-devshell", "timeout_seconds": 0}),
+                "timeout_seconds",
+            ),
+            (
+                json!({"kind": "nix-devshell", "timeout_seconds": 3601}),
+                "timeout_seconds",
+            ),
+            (
+                json!({"kind": "nix-devshell", "flake": "github:x/y"}),
+                "unknown field 'flake'",
+            ),
+        ] {
+            declared["environment"] = environment;
+            invalid(root.path(), &declared, diagnostic);
+        }
+        declared["environment"] = json!({"kind": "nix-devshell"});
+        declared["version"] = json!(2);
+        invalid(
+            root.path(),
+            &declared,
+            "field 'environment' requires manifest version 3",
+        );
+        let path = root.path().join(MANIFEST);
+        fs::write(&path, serde_json::to_string_pretty(&declared).unwrap()).unwrap();
+        let preview = migrate(root.path(), false).unwrap();
+        assert_eq!(preview["status"], "outdated");
+        assert_eq!(preview["to_version"], 3);
+        assert_eq!(migrate(root.path(), true).unwrap()["status"], "migrated");
+        let migrated = load(root.path()).unwrap();
+        assert_eq!(migrated.version, 3);
+        assert!(migrated.environment.is_some());
+        // Version 2's report default survives: version 3 changes no behavior.
+        assert_eq!(migrated.checks[0].warnings, WarningPolicy::Report);
     }
 
     #[test]
@@ -906,7 +1057,7 @@ mod tests {
         let preview = migrate(root.path(), false).unwrap();
         assert_eq!(
             preview,
-            json!({"version":1, "mode":"migrate", "status":"outdated", "from_version":1, "to_version":2})
+            json!({"version":1, "mode":"migrate", "status":"outdated", "from_version":1, "to_version":3})
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), formatted);
         assert_eq!(migrate(root.path(), true).unwrap()["status"], "migrated");
@@ -914,7 +1065,7 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             formatted.replace(
                 "    \"version\": 1",
-                "    \"version\": 2,\n    \"warnings\": \"fail\""
+                "    \"version\": 3,\n    \"warnings\": \"fail\""
             )
         );
         assert_eq!(
@@ -925,7 +1076,7 @@ mod tests {
         fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
         migrate(root.path(), true).unwrap();
         let mut expected = old;
-        expected["version"] = json!(2);
+        expected["version"] = json!(3);
         expected["warnings"] = json!("fail");
         assert_eq!(
             parse_json(&fs::read_to_string(&path).unwrap()).unwrap(),

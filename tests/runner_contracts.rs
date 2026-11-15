@@ -1,3 +1,4 @@
+use project_check::environment::Loaded;
 use project_check::manifest::{self, Check, ExpectedWarning, Manifest};
 use project_check::process::Signals;
 use project_check::runner::{self, Tools};
@@ -56,6 +57,7 @@ impl Fixture {
             scanner: temporary.path().join("scanner"),
             docs: temporary.path().join("docs"),
             ca: Some(ca),
+            nix: temporary.path().join("nix"),
         };
         let fixture = Self {
             temporary,
@@ -94,6 +96,7 @@ impl Fixture {
             &self.scratch,
             &self.cache,
             &self.tools,
+            &Loaded::inherited(),
             &Signals::none(),
         )
         .unwrap()
@@ -133,6 +136,7 @@ impl Fixture {
             version: 2,
             checks,
             watch_ignore: vec![],
+            environment: None,
         }
     }
 }
@@ -884,4 +888,208 @@ fn compiler_cache_selection_is_stable_isolated_and_falls_back_safely() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// A synthetic devShell: `nix` prints a print-dev-env description whose PATH
+/// holds a tool that exists nowhere else and reports the devShell variable.
+fn devshell(fixture: &Fixture, nix_body: Option<&str>) -> Manifest {
+    let toolchain = fixture.temporary.path().join("devshell bin");
+    if !toolchain.exists() {
+        fs::create_dir(&toolchain).unwrap();
+        script(
+            &toolchain.join("pinned-tool"),
+            "printf 'pinned-tool sees %s\\n' \"$PROJECT_FIXTURE\"\n[ \"$RUSTFLAGS\" = '--cfg devshell -D warnings' ]\n[ \"$HOME\" != /synthetic-devshell-home ]",
+        );
+    }
+    let description = json!({"variables":{
+        "PATH":{"type":"exported","value":toolchain},
+        "PROJECT_FIXTURE":{"type":"exported","value":"from-devshell"},
+        "RUSTFLAGS":{"type":"exported","value":"--cfg devshell"},
+        "HOME":{"type":"exported","value":"/synthetic-devshell-home"},
+        "shellHook":{"type":"exported","value":"exit 99"},
+    }});
+    let arguments = fixture.temporary.path().join("nix-arguments");
+    let default_body = format!(
+        "printf '%s\\n' \"$PWD\" \"$@\" > {}\ncat <<'JSON'\n{}\nJSON",
+        quote(arguments.to_str().unwrap()),
+        description
+    );
+    // Rewriting an executable while parallel tests fork races with ETXTBSY:
+    // the synthetic nix is written once and sources a plain data file.
+    let behavior = fixture.temporary.path().join("nix-behavior");
+    fs::write(&behavior, nix_body.unwrap_or(&default_body)).unwrap();
+    if !fixture.tools.nix.exists() {
+        script(
+            &fixture.tools.nix,
+            &format!(". {}", quote(behavior.to_str().unwrap())),
+        );
+    }
+    let mut manifest = fixture.manifest(vec![
+        manifest::validate(
+            &fixture.root,
+            &json!({"version":3,"checks":[{
+                "name":"pinned","argv":["pinned-tool"],"requires":["pinned-tool"],
+                "timeout_seconds":5,"profiles":["fast"]
+            }]}),
+        )
+        .unwrap()
+        .checks
+        .remove(0),
+    ]);
+    manifest.version = 3;
+    manifest.environment = Some(manifest::EnvironmentSpec {
+        shell: "default".into(),
+        timeout_seconds: 5.0,
+    });
+    manifest
+}
+
+fn run_json(fixture: &Fixture, manifest: &Manifest) -> Value {
+    runner::run(
+        &fixture.root,
+        manifest,
+        "fast",
+        true,
+        &fixture.tools,
+        &Signals::none(),
+        Some(&fixture.cache),
+    )
+    .unwrap()
+}
+
+#[test]
+fn declared_environment_supplies_programs_variables_and_precedes_caller_path() {
+    let fixture = Fixture::new();
+    let mut manifest = devshell(&fixture, None);
+    // Without the declaration the tool is only in the devShell: the old failure mode.
+    let inherited = Manifest {
+        environment: None,
+        ..manifest.clone()
+    };
+    let report = run_json(&fixture, &inherited);
+    assert_eq!(report["checks"][1]["status"], "blocked");
+    assert!(diagnostics(&report["checks"][1]).contains("nix-devshell"));
+    assert!(report.get("environment").is_none());
+
+    let report = run_json(&fixture, &manifest);
+    assert_eq!(report["status"], "passed", "{report}");
+    assert!(diagnostics(&report["checks"][1]).contains("pinned-tool sees from-devshell"));
+    assert_eq!(report["environment"]["status"], "loaded");
+    assert_eq!(report["environment"]["installable"], ".#default");
+    let arguments = fs::read_to_string(fixture.temporary.path().join("nix-arguments")).unwrap();
+    let arguments: Vec<_> = arguments.lines().collect();
+    assert_eq!(
+        Path::new(arguments[0]).canonicalize().unwrap(),
+        fixture.root.canonicalize().unwrap()
+    );
+    assert_eq!(
+        arguments[1..],
+        [
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "print-dev-env",
+            "--json",
+            "--no-write-lock-file",
+            ".#default"
+        ]
+    );
+
+    let plan = runner::plan(
+        &fixture.root,
+        &manifest,
+        "fast",
+        false,
+        &fixture.tools,
+        &Signals::none(),
+    )
+    .unwrap();
+    assert_eq!(plan["status"], "ready", "{plan}");
+    assert_eq!(plan["environment"]["status"], "loaded");
+
+    // A program the devShell lacks names the devShell as the place to add it.
+    manifest.checks[0].requires = vec!["synthetic-missing-checker".into()];
+    let report = run_json(&fixture, &manifest);
+    assert_eq!(report["checks"][1]["status"], "blocked");
+    assert!(diagnostics(&report["checks"][1]).contains(runner::ENVIRONMENT_HINT));
+}
+
+#[test]
+fn unavailable_environment_blocks_project_checks_but_not_baseline() {
+    let fixture = Fixture::new();
+    for (body, expected) in [
+        (
+            "printf '%s\\n' \"error: flake does not provide attribute 'devShells.x86_64-linux.default'\" >&2\nexit 1",
+            "does not provide attribute",
+        ),
+        ("printf 'not json'", "unusable description"),
+        ("printf '{\"variables\":{}}'", "exports no PATH"),
+        ("sleep 30", "timed out after"),
+    ] {
+        let manifest = devshell(&fixture, Some(body));
+        let mut manifest = manifest;
+        manifest.environment.as_mut().unwrap().timeout_seconds = 0.5;
+        let report = run_json(&fixture, &manifest);
+        assert_eq!(report["status"], "blocked", "{report}");
+        assert_eq!(report["checks"][0]["status"], "passed");
+        assert_eq!(report["checks"][1]["status"], "blocked");
+        let text = diagnostics(&report["checks"][1]);
+        assert!(
+            text.starts_with("project environment unavailable"),
+            "{text}"
+        );
+        assert!(text.contains(expected), "{text}");
+        assert_eq!(report["environment"]["status"], "blocked");
+        let plan = runner::plan(
+            &fixture.root,
+            &manifest,
+            "fast",
+            false,
+            &fixture.tools,
+            &Signals::none(),
+        )
+        .unwrap();
+        assert_eq!(plan["status"], "blocked");
+        assert_eq!(plan["checks"][1]["environment_unavailable"], true);
+    }
+    let mut manifest = devshell(&fixture, None);
+    let mut tools = fixture.tools.clone();
+    tools.nix = fixture.temporary.path().join("absent-nix");
+    manifest.checks[0].requires = vec!["pinned-tool".into()];
+    let report = runner::run(
+        &fixture.root,
+        &manifest,
+        "fast",
+        true,
+        &tools,
+        &Signals::none(),
+        Some(&fixture.cache),
+    )
+    .unwrap();
+    assert_eq!(report["checks"][1]["status"], "blocked");
+    assert!(diagnostics(&report["checks"][1]).contains("needs `nix`"));
+}
+
+#[test]
+fn host_task_exhaustion_is_an_environment_blocker_not_a_code_failure() {
+    let fixture = Fixture::new();
+    let output = fixture.temporary.path().join("thread-output");
+    let check = fixture.check(
+        "threads",
+        &format!("cat {}\nexit 2", quote(output.to_str().unwrap())),
+    );
+    for line in [
+        "runtime: failed to create new OS thread (have 21 already; errno=11)",
+        "bash: fork: retry: Resource temporarily unavailable",
+        "Error: Resource temporarily unavailable (os error 11)",
+        "RuntimeError: can't start new thread",
+    ] {
+        fs::write(&output, format!("{line}\n")).unwrap();
+        let result = fixture.execute(&check);
+        assert_eq!(result["status"], "blocked", "{line}");
+        assert_eq!(result["resource_exhausted"], true);
+        assert!(diagnostics(&result).contains("task limit"));
+    }
+    // An ordinary failure that merely mentions threads stays a failure.
+    fs::write(&output, "thread test failed\n").unwrap();
+    assert_eq!(fixture.execute(&check)["status"], "failed");
 }

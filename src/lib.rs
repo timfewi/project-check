@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod diagnostics;
 pub mod docs;
+pub mod environment;
 pub mod git;
 pub mod manifest;
 pub mod process;

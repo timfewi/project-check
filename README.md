@@ -26,8 +26,10 @@ their `.project-checks.json` at this installed runner instead of copying it.
 
 Use `project-check fast --plan` (or `full --plan`) to list the selected checks
 and inspect local executable, rules and working-directory availability before a
-run. Add `--json` for a machine-readable report. Planning reads the manifest
-and filesystem only; it never runs the baseline scanner or project commands.
+run. Add `--json` for a machine-readable report. Planning never runs the
+baseline scanner or project commands. Without a declared `environment` it reads
+the manifest and filesystem only; with one it also evaluates that devShell, as
+a run would, so programs resolve from the same `PATH` the checks will get.
 Its `ready` status means prerequisites are present, not that checks passed. The
 report names missing programs but omits command arguments.
 
@@ -105,11 +107,12 @@ host activation remain separate operations.
 ## Check manifest contract
 
 `.project-checks.json` declares its schema `version`; this runner accepts 1
-and 2:
+to 3:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
+  "environment": {"kind": "nix-devshell"},
   "checks": [
     {
       "name": "format",
@@ -128,7 +131,7 @@ and 2:
 | --- | --- | --- |
 | `name` | 1 | Unique lowercase identifier. |
 | `argv` | 1 | Nonempty string array; the first entry is the program. Nothing is passed through a shell. |
-| `requires` | 1 | Programs that must be on `PATH`; explicit relative paths resolve from the check's `cwd`. A missing one marks the check `blocked`, not failed. |
+| `requires` | 1 | Programs that must be on the check's `PATH` (the project environment's, when declared); explicit relative paths resolve from the check's `cwd`. A missing one marks the check `blocked`, not failed. |
 | `cwd` | 1 | Optional project-relative directory; it may not escape the project. |
 | `timeout_seconds` | 1 | Bounds each check and kills its whole process group. |
 | `profiles` | 1 | Nonempty subset of `fast` and `full`. |
@@ -136,6 +139,45 @@ and 2:
 | `input_paths` | 2 | Optional exact project-relative files, or directories ending in `/`, for the advisory changed plan. Omit it when scope is unknown; wildcards and parent traversal are rejected. |
 | `expected_warnings` | 2 | Optional exact warning lines with a reason and an occurrence limit, described below. |
 | `warnings` | 2 | Optional `fail` or `report`, at top level (default for all checks) or per check (override), described below. |
+| `environment` | 3 | Optional top-level project toolchain that every project check runs inside, described below. |
+
+### Project environment
+
+Agents and CI call `project-check` from whatever `PATH` they have: a global
+toolbox, a login shell or a sandbox. A project that pins its own toolchain
+would then be checked with other versions, or a dependency the devShell
+provides (for example `python3.withPackages`) would be missing. The check
+fails or blocks for reasons that have nothing to do with the code, and the
+result differs between agents.
+
+Declare the project's flake devShell and the runner uses it on every run:
+
+```json
+"environment": {"kind": "nix-devshell", "shell": "default", "timeout_seconds": 600}
+```
+
+`shell` (default `default`) names the flake output `.#<shell>` evaluated from
+the project root; `timeout_seconds` (default 600, at most 3600) bounds loading
+it. Before the project checks, the runner evaluates it once with
+`nix print-dev-env --json --no-write-lock-file .#<shell>` using the caller's
+`nix`, so its configuration, daemon and substituters apply. It then applies
+the devShell's exported variables to every project check. The devShell `PATH`
+and `XDG_DATA_DIRS` come first and the caller's values follow, like
+`nix develop`. Programs the devShell does not provide therefore still resolve
+from the caller. Caller-owned variables (`HOME`, `TMPDIR`, `TERM`, CA bundle
+paths and similar) and builder-only values are not replaced. `requires` and
+the plan resolve programs through the same `PATH`.
+
+Nothing is evaluated by a shell: `shellHook`, devenv `enterShell` and shell
+functions do not run. A check that needs them calls the hook explicitly. The
+baseline scanner never uses the project environment.
+
+If the devShell cannot be loaded (no `nix`, an evaluation error, a timeout, or an
+unusable description), the report's `environment` entry and every project check
+are `blocked` with nix's diagnostic tail. The baseline still runs. Successful
+loads report the installable, the duration and the number of applied
+variables. The environment is evaluated per run; nix's evaluation cache keeps
+an unchanged devShell to a few seconds.
 
 ### Schema evolution
 
@@ -162,7 +204,11 @@ Adding a field means: register it with the next version, raise
 `SCHEMA_VERSION`, add a `MIGRATIONS` step that keeps older manifests' behavior
 explicit, and release the runner before manifests adopt the field. Version 1 is
 the field set of runners released before `input_paths`; those runners report a
-version 2 manifest as `project checks require version 1`.
+version 2 manifest as `project checks require version 1`. Version 3 adds only
+`environment`; migrating a version 2 manifest raises its version and changes
+nothing else. Runners released before version 3 reject a version 3 manifest,
+so update every runner that serves a repository (toolbox, host profile, CI
+pins) before that repository declares an environment.
 
 ### Warnings
 
@@ -234,9 +280,19 @@ to 100. The read-only plan includes every declaration for review before running
 project commands.
 
 Missing requirements, process-start errors and shell exit codes 126/127 report
-`blocked`, with instructions to enter `devenv shell` or `nix develop .`, or repair
-the declared `devenv.nix`/`devShells` tools. A failed command whose output names a missing toolchain or
-download also reports `blocked`; the same text in a passing check does not.
+`blocked`. Without a declared environment, the instructions name the
+`environment` declaration and, as a fallback, entering `nix develop .` or
+`devenv shell`. With one, they direct the tool into the project's devShell. A
+failed command whose output names a missing toolchain or download also reports
+`blocked`; the same text in a passing check does not.
+
+A failed command whose output shows that the host refused a new thread or
+process (`failed to create new OS thread`, `fork: Resource temporarily
+unavailable`, `os error 11`, `can't start new thread`) is `blocked` with
+`resource_exhausted: true`. A cgroup task limit or `ulimit -u` was reached, so
+the check never judged the code; retry when fewer processes run. Process start
+retries briefly while the program is still open for writing (`ETXTBSY`), for
+example right after it was built or copied.
 Nonzero command exits include their exit status even when the command printed
 nothing. Diagnostics from the runner do not echo argv arguments; the invoked
 tools remain responsible for their own output.

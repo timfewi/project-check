@@ -107,6 +107,25 @@ fn read_pipe() -> io::Result<(File, std::os::fd::OwnedFd)> {
     Ok((File::from(reader), writer))
 }
 
+/// Spawns `command`, retrying briefly while its executable is still open for
+/// writing (ETXTBSY). A just-written program stays busy until every process
+/// forked meanwhile has exec'd and released the inherited descriptor; that
+/// window is short, so a few bounded retries remove the race without masking
+/// a missing or broken program.
+fn spawn(command: &mut Command) -> io::Result<Child> {
+    let mut delay = Duration::from_millis(5);
+    for _ in 0..6 {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(Errno::ETXTBSY as i32) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            outcome => return outcome,
+        }
+    }
+    command.spawn()
+}
+
 /// Capture at most `limit` combined bytes. With merging enabled, both streams
 /// share one kernel pipe, preserving write order rather than racing reader threads.
 pub fn capture(
@@ -132,7 +151,7 @@ pub fn capture(
     if let Some(writer) = error_writer {
         command.stderr(Stdio::from(writer));
     }
-    let child = command.spawn();
+    let child = spawn(command);
     // Command retains configured Stdio descriptors after spawn. Drop those
     // copies immediately, otherwise EOF cannot be observed on the reader.
     command.stdout(Stdio::null()).stderr(Stdio::null());

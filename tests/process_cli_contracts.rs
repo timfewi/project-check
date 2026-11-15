@@ -32,6 +32,51 @@ fn script(path: &Path, code: &str) {
 }
 
 #[test]
+fn capture_waits_briefly_for_a_program_still_open_for_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fresh-program");
+    script(&path, "printf started");
+    // An open write descriptor makes exec fail with ETXTBSY, exactly as when
+    // a concurrently forked process still holds the just-written file.
+    let writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    assert_eq!(
+        Command::new(&path).output().unwrap_err().raw_os_error(),
+        Some(nix::errno::Errno::ETXTBSY as i32)
+    );
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        drop(writer);
+    });
+    let result = capture(
+        &mut Command::new(&path),
+        Duration::from_secs(5),
+        64,
+        &Signals::none(),
+        true,
+    )
+    .unwrap();
+    release.join().unwrap();
+    assert_eq!(result.returncode, Some(0));
+    assert_eq!(result.output, b"started");
+    // A program that stays busy is still reported, not retried forever.
+    let _held = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let started = Instant::now();
+    let error = capture(
+        &mut Command::new(&path),
+        Duration::from_secs(5),
+        64,
+        &Signals::none(),
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(nix::errno::Errno::ETXTBSY as i32)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn capture_preserves_exact_boundary_and_fails_on_one_extra_byte() {
     for (extra, failure) in [(false, None), (true, Some(CaptureFailure::OutputLimit))] {
         let code = format!(
@@ -103,7 +148,10 @@ struct Package {
 }
 impl Package {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        // Cargo's per-target scratch shares the binaries' filesystem, so the
+        // package hard-links them. A copied executable races with ETXTBSY when
+        // a parallel test forks while the copy's write descriptor is open.
+        let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let prefix = root.path().join("package");
         fs::create_dir_all(prefix.join("bin")).unwrap();
         fs::create_dir_all(prefix.join("share/project-check")).unwrap();
