@@ -7,15 +7,15 @@ license = "MIT"
 description = "Explicit, bounded, argv-only project verification"
 
 [dependencies]
-nix = { version = "=0.30.1", features = ["fs", "poll", "signal", "process"] }
-regex = "=1.12.2"
+nix = { version = "=0.32.0", features = ["fs", "poll", "signal", "process"] }
+regex = "=1.13.1"
 rustpython-parser = { version = "=0.4.0", default-features = false, features = ["location", "num-bigint"] }
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = { version = "=1.0.145", features = ["preserve_order", "arbitrary_precision"] }
-sha2 = "=0.10.9"
-signal-hook = "=0.3.18"
-tempfile = "=3.23.0"
-toml = { version = "=0.9.8", features = ["preserve_order"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+sha2 = "=0.11.1"
+signal-hook = "=0.4.6"
+tempfile = "=3.27.0"
+toml = { version = "=1.2.1", features = ["preserve_order"] }
 toml_parser = "=1.1.5"
 
 [profile.release]

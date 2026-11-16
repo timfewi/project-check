@@ -382,12 +382,14 @@ pub fn compiler_cache(root: &Path) -> Option<PathBuf> {
     if !base.is_absolute() {
         return None;
     }
-    let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_bytes()));
-    let cache = base.join("project-check").join(format!(
-        "{}-{}",
-        root.file_name()?.to_string_lossy(),
-        &hash[..16]
-    ));
+    // The first eight digest bytes, as 16 lowercase hex digits.
+    let hash: String = Sha256::digest(root.as_os_str().as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let cache = base
+        .join("project-check")
+        .join(format!("{}-{hash}", root.file_name()?.to_string_lossy()));
     fs::create_dir_all(&cache).ok()?;
     // Probe actual writability rather than trusting permission bits (ACLs and
     // read-only mounts can differ); the temporary probe removes itself.
