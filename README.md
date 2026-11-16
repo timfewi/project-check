@@ -1,4 +1,4 @@
-# project-check-nix
+# project-check
 
 Native Rust, argv-only project verification runner. It reads a per-repository
 `.project-checks.json` manifest and runs the declared commands with pinned,
@@ -334,7 +334,7 @@ interpolated SQL. A changed ruleset changes the store hash of the
 From the flake:
 
 ```nix
-inputs.project-check.url = "git+https://github.com/timfewi/project-check-nix.git?ref=main";
+inputs.project-check.url = "git+https://github.com/timfewi/project-check.git?ref=main";
 ```
 
 Declare the runner in each project's development shell so Just recipes also work
